@@ -1,0 +1,10 @@
+server:
+  port: 2333
+
+
+postgresql:
+  host: localhost
+  port: 5432
+  user: tomori
+  password: 114514
+  dbname: tomori_db
