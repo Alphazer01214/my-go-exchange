@@ -51,13 +51,11 @@ func (s *sideBook) front() (*types.Order, bool) {
 		return nil, false
 	}
 	lv := s.levels[0]
-	//if lv.head == nil || lv.head.order == nil {
-	//	return nil, false
-	//}
-	if lv.orders.Front() == nil {
+	front := lv.orders.Front()
+	if front == nil {
 		return nil, false
 	}
-	return lv.orders.Front().Value.(*types.Order), true
+	return front.Value.(*types.Order), true
 }
 
 // find 使用 binary search 查找价格对应的 level **下标** (由于 levels 应该是有序的)
@@ -79,6 +77,9 @@ func (s *sideBook) rest(order *types.Order) *entry {
 		s.index[order.Price] = level
 	}
 
+	level.totalAmount += order.Remaining
+	level.orderCount++
+
 	return &entry{
 		order:   order,
 		level:   level,
@@ -99,6 +100,12 @@ func (s *sideBook) remove(ent *entry) {
 // deleteLevel 删除价格对应的 level
 func (s *sideBook) deleteLevel(price uint64) {
 	i := s.find(price)
+	// find 返回的是插入位置(price < levels[i] 的第一个 i)，
+	// 已有元素实际在 i-1
+	if i == 0 || s.levels[i-1].price != price {
+		return // 不存在该档位，防御性退出
+	}
+	i--
 	s.levels = append(s.levels[:i], s.levels[i+1:]...)
 	delete(s.index, price)
 }
@@ -138,7 +145,7 @@ type OrderBook struct {
 	bids    *sideBook // 买方
 	asks    *sideBook // 卖方
 	lastSeq uint64
-	entries map[uint64]*entry
+	entries map[uint64]*entry // order id -> entry
 }
 
 func (ob *OrderBook) Place(order *types.Order) error {
@@ -187,16 +194,38 @@ func (ob *OrderBook) Place(order *types.Order) error {
 	return nil
 }
 
-func (ob *OrderBook) Cancel(id uint64) error {
-	// 1. 检查订单是否存在
+func (ob *OrderBook) Fill(id uint64, amount uint64) error {
 	ent, ok := ob.entries[id]
 	if !ok {
 		return errs.ErrOrderNotFound
 	}
+	if amount == 0 || amount > ent.order.Remaining {
+		return errs.ErrInvalidAmount
+	}
+	ent.order.Remaining -= amount
+	// order 和 level 要同步
+	ent.level.totalAmount -= amount
+	if ent.order.Remaining == 0 {
+		if ent.order.Side == types.Buy {
+			ob.bids.remove(ent)
+		} else {
+			ob.asks.remove(ent)
+		}
+		delete(ob.entries, id)
+	}
+	return nil
+}
+
+func (ob *OrderBook) Cancel(id uint64) (*types.Order, error) {
+	// 1. 检查订单是否存在
+	ent, ok := ob.entries[id]
+	if !ok {
+		return nil, errs.ErrOrderNotFound
+	}
 
 	// 2. 检查订单是否处于可撤销状态（非终态）
 	if ent.order.State.IsTerminal() {
-		return errs.ErrOrderNotCancellable
+		return nil, errs.ErrOrderNotCancellable
 	}
 
 	// 3. 从 book 中移除
@@ -207,7 +236,7 @@ func (ob *OrderBook) Cancel(id uint64) error {
 	}
 	ent.order.State = types.StateCanceled
 	delete(ob.entries, id)
-	return nil
+	return ent.order, nil
 }
 
 func (ob *OrderBook) BestBid() (price uint64, totalAmount uint64, ok bool) {
@@ -230,6 +259,7 @@ func (ob *OrderBook) Asks(n int) []Level {
 
 func (ob *OrderBook) Front(side types.Side) (*types.Order, bool) {
 	if side == types.Buy {
-		return ob.
+		return ob.bids.front()
 	}
+	return ob.asks.front()
 }
