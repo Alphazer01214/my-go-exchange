@@ -17,12 +17,8 @@ type Level struct {
 type priceLevel struct {
 	price       uint64
 	orders      *list.List
-	orderCount  uint64 // 订单数
+	orderCount  uint64
 	totalAmount uint64
-
-	head *entry
-	tail *entry
-	next *entry
 }
 
 func newPriceLevel(price uint64) *priceLevel {
@@ -32,7 +28,7 @@ func newPriceLevel(price uint64) *priceLevel {
 	}
 }
 
-// entry 用于 o1 撤单
+// entry 用于 O(1) 撤单 / 撮合定位
 type entry struct {
 	order   *types.Order
 	level   *priceLevel
@@ -42,7 +38,7 @@ type entry struct {
 // sideBook ask/bid side
 type sideBook struct {
 	less   func(a uint64, b uint64) bool
-	levels []*priceLevel          // ask: 价格从低到高排序; bid: 价格从高到低排序
+	levels []*priceLevel          // ask: 价格从低到高; bid: 价格从高到低
 	index  map[uint64]*priceLevel // 价格索引
 }
 
@@ -58,7 +54,7 @@ func (s *sideBook) front() (*types.Order, bool) {
 	return front.Value.(*types.Order), true
 }
 
-// find 使用 binary search 查找价格对应的 level **下标** (由于 levels 应该是有序的)
+// find 使用 binary search 查找价格对应的插入位置下标
 func (s *sideBook) find(price uint64) int {
 	return sort.Search(len(s.levels), func(i int) bool {
 		return s.less(price, s.levels[i].price)
@@ -68,12 +64,11 @@ func (s *sideBook) find(price uint64) int {
 // rest 挂单
 func (s *sideBook) rest(order *types.Order) *entry {
 	level, ok := s.index[order.Price]
-	// 挡位不存在就新建一个
+	// 如果不存在该价格档位，则新建一个 priceLevel 并插入 levels 和 index
 	if !ok {
 		level = newPriceLevel(order.Price)
 		i := s.find(order.Price)
-		// insert, s.levels[i] = current
-		s.levels = append(append(s.levels[:i], level), s.levels[i:]...)
+		s.insertLevel(i, level)
 		s.index[order.Price] = level
 	}
 
@@ -85,6 +80,13 @@ func (s *sideBook) rest(order *types.Order) *entry {
 		level:   level,
 		element: level.orders.PushBack(order),
 	}
+}
+
+// insertLevel 在 i 处插入 level（避免 append 双重切片覆盖底层数组）
+func (s *sideBook) insertLevel(i int, level *priceLevel) {
+	s.levels = append(s.levels, nil)
+	copy(s.levels[i+1:], s.levels[i:])
+	s.levels[i] = level
 }
 
 func (s *sideBook) remove(ent *entry) {
@@ -100,7 +102,7 @@ func (s *sideBook) remove(ent *entry) {
 // deleteLevel 删除价格对应的 level
 func (s *sideBook) deleteLevel(price uint64) {
 	i := s.find(price)
-	// find 返回的是插入位置(price < levels[i] 的第一个 i)，
+	// find 返回的是插入位置(price < levels[i] 或 price > levels[i] 的第一个 i)，
 	// 已有元素实际在 i-1
 	if i == 0 || s.levels[i-1].price != price {
 		return // 不存在该档位，防御性退出
@@ -140,52 +142,86 @@ func (s *sideBook) depth(n int) []Level {
 	return levels
 }
 
+// availableAmount 从最优价开始累计可成交量
+// takerSide 为买方时，只累计 price <= limitPrice 的卖档；卖方反之
+func (s *sideBook) availableAmount(takerSide types.Side, limit uint64) uint64 {
+	var total uint64
+	for _, lv := range s.levels {
+		if takerSide == types.Buy && lv.price > limit {
+			break
+		}
+		if takerSide == types.Sell && lv.price < limit {
+			break
+		}
+		total += lv.totalAmount
+	}
+	return total
+}
+
 type OrderBook struct {
 	inst    *types.Instrument
-	bids    *sideBook // 买方
-	asks    *sideBook // 卖方
-	lastSeq uint64
+	bids    *sideBook
+	asks    *sideBook
 	entries map[uint64]*entry // order id -> entry
 }
 
-func (ob *OrderBook) Place(order *types.Order) error {
-	// 1. 校验 Side
-	if order.Side != types.Buy && order.Side != types.Sell {
+func NewOrderBook(inst *types.Instrument) *OrderBook {
+	return &OrderBook{
+		inst: inst,
+		bids: &sideBook{
+			// bid: 价格从高到低；find 找第一个 price > level.price 的位置
+			less:  func(a, b uint64) bool { return a > b },
+			index: make(map[uint64]*priceLevel),
+		},
+		asks: &sideBook{
+			// ask: 价格从低到高；find 找第一个 price < level.price 的位置
+			less:  func(a, b uint64) bool { return a < b },
+			index: make(map[uint64]*priceLevel),
+		},
+		entries: make(map[uint64]*entry),
+	}
+}
+
+// ValidatePlace 校验下单参数（撮合前调用，避免非法单先成交）
+func ValidatePlace(orderType types.OrderType, price uint64, amount uint64, side types.Side, tif types.TIF) error {
+	if side != types.Buy && side != types.Sell {
 		return errs.ErrInvalidSide
 	}
-
-	// 2. 校验 OrderType
-	if order.Type != types.Limit && order.Type != types.Market {
+	if orderType != types.Limit && orderType != types.Market {
 		return errs.ErrInvalidOrderType
 	}
-
-	// 3. 校验 TIF
-	if order.TIF != types.GTC && order.TIF != types.IOC && order.TIF != types.FOK {
+	if tif != types.GTC && tif != types.IOC && tif != types.FOK {
 		return errs.ErrInvalidTIF
 	}
-
-	// 4. 校验 Amount
-	if order.Amount == 0 {
+	if amount == 0 {
 		return errs.ErrInvalidAmount
 	}
-
-	// 5. 校验 Price (Limit 必须 > 0, Market 必须 == 0)
-	if order.Type == types.Limit && order.Price == 0 {
+	if orderType == types.Limit && price == 0 {
 		return errs.ErrInvalidPrice
 	}
-	if order.Type == types.Market && order.Price != 0 {
+	if orderType == types.Market && price != 0 {
 		return errs.ErrMarketOrderWithPrice
 	}
+	return nil
+}
 
-	// 7. 检查订单 ID 是否重复
+func (ob *OrderBook) Place(order *types.Order) error {
+	if err := ValidatePlace(order.Type, order.Price, order.Amount, order.Side, order.TIF); err != nil {
+		return err
+	}
 	if _, exists := ob.entries[order.ID]; exists {
 		return errs.ErrDuplicateOrderID
 	}
+	// 市价单不允许入 book
+	if order.Type == types.Market {
+		return errs.ErrMarketOrderCannotRest
+	}
 
-	// 8. 分配 Seq，设置状态，挂单
-	ob.lastSeq++
-	order.Seq = ob.lastSeq
-	order.State = types.StateInBook
+	if order.Remaining < order.Amount {
+		order.State = types.StatePartial
+	} else {
+		order.State = types.StateInBook
+	}
 	if order.Side == types.Buy {
 		ob.entries[order.ID] = ob.bids.rest(order)
 	} else {
@@ -202,33 +238,35 @@ func (ob *OrderBook) Fill(id uint64, amount uint64) error {
 	if amount == 0 || amount > ent.order.Remaining {
 		return errs.ErrInvalidAmount
 	}
+
 	ent.order.Remaining -= amount
 	// order 和 level 要同步
 	ent.level.totalAmount -= amount
+
 	if ent.order.Remaining == 0 {
+		ent.order.State = types.StateFilled
+		// remove 时 Remaining 已是 0，不会再减 totalAmount
 		if ent.order.Side == types.Buy {
 			ob.bids.remove(ent)
 		} else {
 			ob.asks.remove(ent)
 		}
 		delete(ob.entries, id)
+	} else {
+		ent.order.State = types.StatePartial
 	}
 	return nil
 }
 
 func (ob *OrderBook) Cancel(id uint64) (*types.Order, error) {
-	// 1. 检查订单是否存在
 	ent, ok := ob.entries[id]
 	if !ok {
 		return nil, errs.ErrOrderNotFound
 	}
-
-	// 2. 检查订单是否处于可撤销状态（非终态）
 	if ent.order.State.IsTerminal() {
 		return nil, errs.ErrOrderNotCancellable
 	}
 
-	// 3. 从 book 中移除
 	if ent.order.Side == types.Buy {
 		ob.bids.remove(ent)
 	} else {
@@ -240,12 +278,10 @@ func (ob *OrderBook) Cancel(id uint64) (*types.Order, error) {
 }
 
 func (ob *OrderBook) BestBid() (price uint64, totalAmount uint64, ok bool) {
-
 	return ob.bids.best()
 }
 
 func (ob *OrderBook) BestAsk() (price uint64, totalAmount uint64, ok bool) {
-
 	return ob.asks.best()
 }
 
@@ -262,4 +298,19 @@ func (ob *OrderBook) Front(side types.Side) (*types.Order, bool) {
 		return ob.bids.front()
 	}
 	return ob.asks.front()
+}
+
+// Available 对面可成交量（FOK 预检用）
+// taker 为买单时看 asks，限价为 taker.Price；市价单不限价
+func (ob *OrderBook) Available(takerSide types.Side, takerPrice uint64, market bool) uint64 {
+	if takerSide == types.Buy {
+		if market {
+			return ob.asks.availableAmount(types.Buy, 0)
+		}
+		return ob.asks.availableAmount(types.Buy, takerPrice)
+	}
+	if market {
+		return ob.bids.availableAmount(types.Sell, 0)
+	}
+	return ob.bids.availableAmount(types.Sell, takerPrice)
 }

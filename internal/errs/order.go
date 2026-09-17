@@ -13,8 +13,10 @@ var (
 
 // ---- 业务规则校验 (Place 时第二步检查) ----
 var (
-	ErrMarketOrderWithPrice = errors.New("market order must not have a price")
-	ErrDuplicateOrderID     = errors.New("duplicate order ID")
+	ErrMarketOrderWithPrice  = errors.New("market order must not have a price")
+	ErrMarketOrderCannotRest = errors.New("market order cannot rest in book")
+	ErrDuplicateOrderID      = errors.New("duplicate order ID")
+	ErrFOKCannotFill         = errors.New("FOK order cannot be fully filled")
 )
 
 // ---- 撤单校验 (Cancel 时检查) ----

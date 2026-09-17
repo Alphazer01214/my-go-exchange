@@ -70,6 +70,7 @@ func (t TIF) String() string {
 
 type Order struct {
 	ID        uint64
+	AccountID uint64
 	Side      Side
 	Type      OrderType
 	Price     uint64

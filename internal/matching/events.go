@@ -18,6 +18,7 @@ const (
 type OrderAccepted struct {
 	Seq       uint64          `json:"seq"`
 	OrderID   uint64          `json:"order_id"`
+	AccountID uint64          `json:"account_id"`
 	Side      types.Side      `json:"side"`
 	Price     uint64          `json:"price"`
 	OrderType types.OrderType `json:"order_type"`
@@ -79,13 +80,15 @@ func (e *OrderRejected) EventEnvelope() (*EventEnvelope, error) {
 }
 
 type Trade struct {
-	Seq          uint64     `json:"seq"`
-	TradeID      uint64     `json:"trade_id"`
-	Price        uint64     `json:"price"`
-	Amount       uint64     `json:"amount"`
-	TakerSide    types.Side `json:"taker_side"`
-	TakerOrderID uint64     `json:"taker_order_id"`
-	MakerOrderID uint64     `json:"maker_order_id"`
+	Seq            uint64     `json:"seq"`
+	TradeID        uint64     `json:"trade_id"`
+	Price          uint64     `json:"price"`
+	Amount         uint64     `json:"amount"`
+	TakerSide      types.Side `json:"taker_side"`
+	TakerOrderID   uint64     `json:"taker_order_id"`
+	MakerOrderID   uint64     `json:"maker_order_id"`
+	TakerAccountID uint64     `json:"taker_account_id"`
+	MakerAccountID uint64     `json:"maker_account_id"`
 }
 
 func (e *Trade) Type() EventType { return EventTrade }
