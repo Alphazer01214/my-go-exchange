@@ -1,3 +1,4 @@
+> 各模块详细文档见 [modules/](./modules/README.md)。本文保留早期实现笔记。
 
 ## Orderbook
 

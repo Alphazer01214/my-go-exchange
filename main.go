@@ -12,14 +12,9 @@ func main() {
 		Base:   "BTC",
 		Quote:  "USDT",
 	}
-	engine := matching.NewEngine(btcusdt)
-	in := make(chan matching.Command, 1024)
-	out := make(chan matching.Event, 1024)
-	ctx, cancel := context.WithCancel(context.Background())
+	_ = matching.NewEngine(btcusdt)
+	_ = make(chan matching.Command, 1024)
+	_ = make(chan matching.Event, 1024)
+	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	go func() {
-		engine.Run()
-	}()
-
 }

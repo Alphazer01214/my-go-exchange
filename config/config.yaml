@@ -1,10 +1,33 @@
 server:
   port: 2333
 
-
 postgresql:
   host: localhost
   port: 5432
   user: tomori
   password: 114514
   dbname: tomori_db
+
+# md-ingest: market data pipeline
+listen: "127.0.0.1:8088"
+
+bridge:
+  python: python
+  script: tools/md_bridge/md_bridge.py
+  # SimNow 7x24 (works with openctp-ctp). For openctp TTS use tcp://trading.openctp.cn:30011
+  # with a TTS-compatible binding (standard openctp-ctp returns 4097 on TTS).
+  front: "tcp://182.254.243.31:40011"
+  broker: "9999"
+  user: ""
+  password: ""
+  symbols:
+    - cu2611
+    - al2611
+    - rb2701
+    - au2612
+
+nats:
+  embedded: true
+  port: 4222
+  store_dir: data/nats
+  url: "nats://127.0.0.1:4222"

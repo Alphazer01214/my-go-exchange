@@ -1,3 +1,38 @@
+# IDE
 .idea/
-config/
+.vscode/
+
+# local scratch / agent workspace
+.scratch/
+
+# build output
+bin/
+*.exe
+
+# runtime data (NATS JetStream store, caches)
+data/
+
+# CTP API flow files
+*.con
+
+# env / secrets
 *.env
+.env.*
+
+# logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# local config overrides (tracked config/config.yaml may still be updated intentionally)
+*.local.yaml
+*.local.yml
