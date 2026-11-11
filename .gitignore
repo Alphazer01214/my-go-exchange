@@ -36,3 +36,5 @@ Thumbs.db
 # local config overrides (tracked config/config.yaml may still be updated intentionally)
 *.local.yaml
 *.local.yml
+
+bin/

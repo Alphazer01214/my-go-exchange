@@ -10,7 +10,7 @@ import (
 
 // Account 账户模型
 type Account struct {
-	ID        uint   `gorm:"primaryKey"`
+	ID        uint64 `gorm:"primaryKey"`
 	UserID    string `gorm:"not null;size:64"`
 	Currency  string `gorm:"not null;size:64"`
 	Available int64  `gorm:"available"`
