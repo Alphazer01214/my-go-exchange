@@ -1,84 +1,69 @@
 package matching
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+
 	"my-go-exchange/internal/types"
 )
 
+// EventType identifies an event in the serialized event stream.
 type EventType string
 
 const (
-	EventOrderAccepted  EventType = "order_accepted"
-	EventOrderCancelled EventType = "order_cancelled"
-	EventOrderRejected  EventType = "order_rejected"
-	EventTrade          EventType = "trade"
+	EventOrderAccepted EventType = "order_accepted"
+	EventOrderCanceled EventType = "order_canceled"
+	EventOrderRejected EventType = "order_rejected"
+	EventTrade         EventType = "trade"
 )
 
+// Event is the small interface produced by Engine. Sequence exposes the
+// engine-wide ordering without forcing callers to type-switch first.
+type Event interface {
+	Kind() EventType
+	Sequence() uint64
+}
+
+// OrderAccepted records an order accepted by the matching engine.
 type OrderAccepted struct {
 	Seq       uint64          `json:"seq"`
 	OrderID   uint64          `json:"order_id"`
 	AccountID uint64          `json:"account_id"`
-	Side      types.Side      `json:"side"`
 	Price     uint64          `json:"price"`
-	OrderType types.OrderType `json:"order_type"`
 	Amount    uint64          `json:"amount"`
+	Side      types.Side      `json:"side"`
+	Type      types.OrderType `json:"type"`
 	TIF       types.TIF       `json:"tif"`
 }
 
-func (e *OrderAccepted) Type() EventType { return EventOrderAccepted }
+func (e *OrderAccepted) Kind() EventType  { return EventOrderAccepted }
+func (e *OrderAccepted) Sequence() uint64 { return e.Seq }
 
-func (e *OrderAccepted) Marshal() ([]byte, error) {
-	return json.Marshal(e)
-}
-
-func (e *OrderAccepted) EventEnvelope() (*EventEnvelope, error) {
-	payload, err := json.Marshal(e)
-	if err != nil {
-		return nil, err
-	}
-	return &EventEnvelope{MsgType: e.Type(), Payload: payload}, nil
-}
-
-type OrderCancelled struct {
+// OrderCanceled records cancellation of an accepted order. Remaining is the
+// quantity that had not traded when cancellation took effect.
+type OrderCanceled struct {
 	Seq       uint64 `json:"seq"`
 	OrderID   uint64 `json:"order_id"`
 	Remaining uint64 `json:"remaining"`
 }
 
-func (e *OrderCancelled) Type() EventType { return EventOrderCancelled }
+func (e *OrderCanceled) Kind() EventType  { return EventOrderCanceled }
+func (e *OrderCanceled) Sequence() uint64 { return e.Seq }
 
-func (e *OrderCancelled) Marshal() ([]byte, error) {
-	return json.Marshal(e)
-}
-
-func (e *OrderCancelled) EventEnvelope() (*EventEnvelope, error) {
-	payload, err := json.Marshal(e)
-	if err != nil {
-		return nil, err
-	}
-	return &EventEnvelope{MsgType: e.Type(), Payload: payload}, nil
-}
-
+// OrderRejected records a command that did not complete successfully.
+// OrderID is zero when rejection happened before an ID was assigned.
 type OrderRejected struct {
-	Seq    uint64 `json:"seq"`
-	Reason string `json:"reason"`
+	Seq     uint64 `json:"seq"`
+	OrderID uint64 `json:"order_id"`
+	Reason  string `json:"reason"`
 }
 
-func (e *OrderRejected) Type() EventType { return EventOrderRejected }
+func (e *OrderRejected) Kind() EventType  { return EventOrderRejected }
+func (e *OrderRejected) Sequence() uint64 { return e.Seq }
 
-func (e *OrderRejected) Marshal() ([]byte, error) {
-	return json.Marshal(e)
-}
-
-func (e *OrderRejected) EventEnvelope() (*EventEnvelope, error) {
-	payload, err := json.Marshal(e)
-	if err != nil {
-		return nil, err
-	}
-	return &EventEnvelope{MsgType: e.Type(), Payload: payload}, nil
-}
-
+// Trade records one execution between a resting maker and an incoming taker.
 type Trade struct {
 	Seq            uint64     `json:"seq"`
 	TradeID        uint64     `json:"trade_id"`
@@ -91,75 +76,95 @@ type Trade struct {
 	MakerAccountID uint64     `json:"maker_account_id"`
 }
 
-func (e *Trade) Type() EventType { return EventTrade }
+func (e *Trade) Kind() EventType  { return EventTrade }
+func (e *Trade) Sequence() uint64 { return e.Seq }
 
-func (e *Trade) Marshal() ([]byte, error) {
-	return json.Marshal(e)
-}
-
-func (e *Trade) EventEnvelope() (*EventEnvelope, error) {
-	payload, err := json.Marshal(e)
-	if err != nil {
-		return nil, err
-	}
-	return &EventEnvelope{MsgType: e.Type(), Payload: payload}, nil
-}
-
-// Event 是所有事件的公共接口
-type Event interface {
-	Type() EventType
-	Marshal() ([]byte, error)
-	EventEnvelope() (*EventEnvelope, error)
-}
-
-// EventEnvelope 用于多态序列化，支持混合事件流
-type EventEnvelope struct {
-	MsgType EventType       `json:"type"`
+type eventEnvelope struct {
+	Type    EventType       `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 }
 
-// MarshalEvent 将任意 Event 序列化为 Envelope JSON
+// MarshalEvent serializes a supported event as a type-tagged envelope.
 func MarshalEvent(event Event) ([]byte, error) {
-	env, err := event.EventEnvelope()
-	if err != nil {
-		return nil, err
+	var payload any
+	switch e := event.(type) {
+	case *OrderAccepted:
+		if e == nil {
+			return nil, fmt.Errorf("marshal event: nil %T", e)
+		}
+		payload = e
+	case *OrderCanceled:
+		if e == nil {
+			return nil, fmt.Errorf("marshal event: nil %T", e)
+		}
+		payload = e
+	case *OrderRejected:
+		if e == nil {
+			return nil, fmt.Errorf("marshal event: nil %T", e)
+		}
+		payload = e
+	case *Trade:
+		if e == nil {
+			return nil, fmt.Errorf("marshal event: nil %T", e)
+		}
+		payload = e
+	default:
+		return nil, fmt.Errorf("marshal event: unsupported type %T", event)
 	}
-	return json.Marshal(env)
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal event payload: %w", err)
+	}
+	return json.Marshal(eventEnvelope{Type: event.Kind(), Payload: raw})
 }
 
-// UnmarshalEvent 从 Envelope JSON 反序列化为具体事件
+// UnmarshalEvent decodes a type-tagged event envelope.
 func UnmarshalEvent(data []byte) (Event, error) {
-	var env EventEnvelope
-	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal event envelope: %w", err)
+	var env eventEnvelope
+	if err := decodeEventJSON(data, &env); err != nil {
+		return nil, fmt.Errorf("decode event envelope: %w", err)
+	}
+	if env.Type == "" {
+		return nil, fmt.Errorf("decode event envelope: missing type")
+	}
+	if len(env.Payload) == 0 || string(env.Payload) == "null" {
+		return nil, fmt.Errorf("decode event envelope: missing payload")
 	}
 
-	switch env.MsgType {
+	var event Event
+	switch env.Type {
 	case EventOrderAccepted:
-		var e OrderAccepted
-		if err := json.Unmarshal(env.Payload, &e); err != nil {
-			return nil, err
-		}
-		return &e, nil
-	case EventOrderCancelled:
-		var e OrderCancelled
-		if err := json.Unmarshal(env.Payload, &e); err != nil {
-			return nil, err
-		}
-		return &e, nil
+		event = &OrderAccepted{}
+	case EventOrderCanceled:
+		event = &OrderCanceled{}
 	case EventOrderRejected:
-		var e OrderRejected
-		if err := json.Unmarshal(env.Payload, &e); err != nil {
-			return nil, err
-		}
-		return &e, nil
+		event = &OrderRejected{}
 	case EventTrade:
-		var e Trade
-		if err := json.Unmarshal(env.Payload, &e); err != nil {
-			return nil, err
-		}
-		return &e, nil
+		event = &Trade{}
 	default:
-		return nil, fmt.Errorf("unknown event type: %s", env.MsgType)
+		return nil, fmt.Errorf("decode event envelope: unknown type %q", env.Type)
 	}
+
+	if err := decodeEventJSON(env.Payload, event); err != nil {
+		return nil, fmt.Errorf("decode %s payload: %w", env.Type, err)
+	}
+	return event, nil
+}
+
+func decodeEventJSON(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values")
+		}
+		return fmt.Errorf("trailing data: %w", err)
+	}
+	return nil
 }

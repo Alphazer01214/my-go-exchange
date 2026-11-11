@@ -2,17 +2,20 @@ package matching
 
 import (
 	"context"
+	"fmt"
+
 	"my-go-exchange/internal/errs"
 	"my-go-exchange/internal/orderbook"
 	"my-go-exchange/internal/types"
 )
 
-// Engine 接收 command 撮合并返回 event
-// Seq / OrderID / TradeID 只在这里分配，OrderBook 不再改写 Seq
+// Engine applies commands to one instrument's order book and returns all
+// resulting events in causal order. Apply is not safe for concurrent use.
 type Engine struct {
 	inst *types.Instrument
 	ob   *orderbook.OrderBook
 
+	orders  map[uint64]*types.Order
 	seq     uint64
 	orderID uint64
 	tradeID uint64
@@ -20,212 +23,225 @@ type Engine struct {
 
 func NewEngine(inst *types.Instrument) *Engine {
 	return &Engine{
-		inst: inst,
-		ob:   orderbook.NewOrderBook(inst),
+		inst:   inst,
+		ob:     orderbook.NewOrderBook(inst),
+		orders: make(map[uint64]*types.Order),
 	}
 }
 
+// OrderBook exposes the engine's current book for market-data adapters and
+// tests. Callers must not mutate orders through this module.
 func (e *Engine) OrderBook() *orderbook.OrderBook {
 	return e.ob
 }
 
+// Apply executes one command and returns its ordered events.
 func (e *Engine) Apply(cmd Command) []Event {
-	switch c := cmd.(type) {
+	switch command := cmd.(type) {
 	case *PlaceOrder:
-		return e.applyPlace(c)
+		if command == nil {
+			return e.reject(0, "nil place-order command")
+		}
+		return e.applyPlace(command)
 	case *CancelOrder:
-		return e.applyCancel(c)
+		if command == nil {
+			return e.reject(0, "nil cancel-order command")
+		}
+		return e.applyCancel(command)
 	default:
-		return nil
+		return e.reject(0, fmt.Sprintf("unsupported command type %T", cmd))
 	}
 }
 
 func (e *Engine) applyPlace(cmd *PlaceOrder) []Event {
-	e.seq++
-
-	if err := orderbook.ValidatePlace(cmd.OrderType, cmd.Price, cmd.Amount, cmd.Side, cmd.TIF); err != nil {
-		return []Event{
-			&OrderRejected{
-				Seq:    e.seq,
-				Reason: err.Error(),
-			},
-		}
+	if cmd.AccountID == 0 {
+		return e.reject(0, errs.ErrInvalidAccountID.Error())
+	}
+	if err := orderbook.ValidatePlace(cmd.Type, cmd.Price, cmd.Amount, cmd.Side, cmd.TIF); err != nil {
+		return e.reject(0, err.Error())
 	}
 
-	// FOK：先预检能否全部成交
-	if cmd.TIF == types.FOK {
-		avail := e.ob.Available(cmd.Side, cmd.Price, cmd.OrderType == types.Market)
-		if avail < cmd.Amount {
-			return []Event{
-				&OrderRejected{
-					Seq:    e.seq,
-					Reason: errs.ErrFOKCannotFill.Error(),
-				},
-			}
-		}
-	}
+	// TIF/FOK preflight is intentionally disabled until TIF semantics are defined.
+	// if cmd.TIF == types.FOK {
+	// 	market := cmd.Type == types.Market
+	// 	if available := e.ob.Available(cmd.Side, cmd.Price, market); available < cmd.Amount {
+	// 		return e.reject(0, errs.ErrFOKCannotFill.Error())
+	// 	}
+	// }
 
 	e.orderID++
+	acceptedSeq := e.nextSequence()
 	taker := &types.Order{
 		ID:        e.orderID,
 		AccountID: cmd.AccountID,
 		Side:      cmd.Side,
-		Type:      cmd.OrderType,
+		Type:      cmd.Type,
 		Price:     cmd.Price,
 		Amount:    cmd.Amount,
 		Remaining: cmd.Amount,
 		TIF:       cmd.TIF,
-		Seq:       e.seq,
+		Seq:       acceptedSeq,
 		State:     types.StateAccept,
 	}
 
+	e.orders[taker.ID] = taker
+
 	events := []Event{
 		&OrderAccepted{
-			Seq:       e.seq,
+			Seq:       acceptedSeq,
 			OrderID:   taker.ID,
 			AccountID: taker.AccountID,
-			Side:      taker.Side,
 			Price:     taker.Price,
-			OrderType: taker.Type,
 			Amount:    taker.Amount,
+			Side:      taker.Side,
+			Type:      taker.Type,
 			TIF:       taker.TIF,
 		},
 	}
 
-	// 撮合
+	events = append(events, e.match(taker)...)
+	return e.finishTaker(taker, events)
+}
+
+func (e *Engine) applyCancel(cmd *CancelOrder) []Event {
+	if cmd.OrderID == 0 {
+		return e.reject(0, errs.ErrInvalidOrderID.Error())
+	}
+
+	order, known := e.orders[cmd.OrderID]
+	if !known {
+		return e.reject(cmd.OrderID, errs.ErrOrderNotFound.Error())
+	}
+	if order.State.IsTerminal() {
+		return e.reject(cmd.OrderID, errs.ErrOrderNotCancellable.Error())
+	}
+
+	remaining, err := e.ob.Cancel(cmd.OrderID)
+	if err != nil {
+		return e.reject(cmd.OrderID, err.Error())
+	}
+
+	return []Event{
+		&OrderCanceled{
+			Seq:       e.nextSequence(),
+			OrderID:   cmd.OrderID,
+			Remaining: remaining,
+		},
+	}
+}
+
+// match consumes price/time-priority liquidity until the taker is filled or no
+// eligible resting order remains.
+func (e *Engine) match(taker *types.Order) []Event {
+	events := make([]Event, 0)
+
 	for taker.Remaining > 0 {
-		opposite := taker.Side.Opposite()
-		best, _, ok := e.best(opposite)
-		if !ok || !e.canCross(taker, best) {
-			break
-		}
-		maker, ok := e.ob.Front(opposite)
-		if !ok {
+		maker, ok := e.ob.Front(taker.Side.Opposite())
+		if !ok || !e.crosses(taker, maker.Price) {
 			break
 		}
 
-		q := taker.Remaining
-		if q > maker.Remaining {
-			q = maker.Remaining
+		amount := taker.Remaining
+		if amount > maker.Remaining {
+			amount = maker.Remaining
 		}
+		if err := e.ob.Fill(maker.ID, amount); err != nil {
+			break
+		}
+
+		taker.Remaining -= amount
 		e.tradeID++
 		events = append(events, &Trade{
-			Seq:            e.seq,
+			Seq:            e.nextSequence(),
 			TradeID:        e.tradeID,
 			Price:          maker.Price,
-			Amount:         q,
+			Amount:         amount,
 			TakerSide:      taker.Side,
 			TakerOrderID:   taker.ID,
 			MakerOrderID:   maker.ID,
 			TakerAccountID: taker.AccountID,
 			MakerAccountID: maker.AccountID,
 		})
-		taker.Remaining -= q
-		if err := e.ob.Fill(maker.ID, q); err != nil {
-			panic("Fill failed: " + err.Error())
-		}
 	}
 
-	return e.finishTaker(taker, events)
+	return events
 }
 
-// finishTaker 按 TIF / OrderType 处理剩余量
+// finishTaker applies time-in-force and order-type semantics to any quantity
+// that did not execute.
 func (e *Engine) finishTaker(taker *types.Order, events []Event) []Event {
 	if taker.Remaining == 0 {
 		taker.State = types.StateFilled
 		return events
 	}
 
-	switch taker.TIF {
-	case types.IOC:
+	// Market orders never rest. TIF-specific remainder handling is disabled.
+	if taker.Type == types.Market {
 		taker.State = types.StateCanceled
-		events = append(events, &OrderCancelled{
-			Seq:       e.seq,
+		return append(events, &OrderCanceled{
+			Seq:       e.nextSequence(),
 			OrderID:   taker.ID,
 			Remaining: taker.Remaining,
 		})
-	case types.FOK:
-		// 预检通过后理论上应全部成交；防御：不应走到这里
+	}
+
+	if err := e.ob.Place(taker); err != nil {
 		taker.State = types.StateCanceled
-		events = append(events, &OrderCancelled{
-			Seq:       e.seq,
+		return append(events, &OrderCanceled{
+			Seq:       e.nextSequence(),
 			OrderID:   taker.ID,
 			Remaining: taker.Remaining,
 		})
-	case types.GTC:
-		// 只有限价 GTC 才允许挂入 book
-		if taker.Type != types.Limit {
-			taker.State = types.StateCanceled
-			events = append(events, &OrderCancelled{
-				Seq:       e.seq,
-				OrderID:   taker.ID,
-				Remaining: taker.Remaining,
-			})
-			return events
-		}
-		if taker.Amount == taker.Remaining {
-			taker.State = types.StateInBook
-		} else {
-			taker.State = types.StatePartial
-		}
-		if err := e.ob.Place(taker); err != nil {
-			// 不 panic，退回 rejected
-			return append(events, &OrderRejected{
-				Seq:    e.seq,
-				Reason: err.Error(),
-			})
-		}
 	}
 	return events
 }
 
-func (e *Engine) applyCancel(cmd *CancelOrder) []Event {
-	e.seq++
-
-	order, err := e.ob.Cancel(cmd.OrderID)
-	if err != nil {
-		return []Event{
-			&OrderRejected{
-				Seq:    e.seq,
-				Reason: err.Error(),
-			},
-		}
-	}
-	return []Event{
-		&OrderCancelled{
-			Seq:       e.seq,
-			OrderID:   order.ID,
-			Remaining: order.Remaining,
-		},
-	}
-}
-
-func (e *Engine) best(side types.Side) (price uint64, totalAmount uint64, ok bool) {
-	if side == types.Buy {
-		return e.ob.BestBid()
-	}
-	return e.ob.BestAsk()
-}
-
-// canCross 市价单始终可交叉；限价单按价格判断
-func (e *Engine) canCross(taker *types.Order, oppositePrice uint64) bool {
+func (e *Engine) crosses(taker *types.Order, oppositePrice uint64) bool {
 	if taker.Type == types.Market {
 		return true
 	}
 	if taker.Side == types.Buy {
-		return oppositePrice <= taker.Price
+		return taker.Price >= oppositePrice
 	}
-	return oppositePrice >= taker.Price
+	return taker.Price <= oppositePrice
 }
 
-func RunMatchingEngine(ctx context.Context, engine *Engine, in <-chan Command, out chan<- Event) error {
+func (e *Engine) reject(orderID uint64, reason string) []Event {
+	return []Event{
+		&OrderRejected{
+			Seq:     e.nextSequence(),
+			OrderID: orderID,
+			Reason:  reason,
+		},
+	}
+}
+
+func (e *Engine) nextSequence() uint64 {
+	e.seq++
+	return e.seq
+}
+
+// RunMatchingEngine serially applies commands and publishes their events until
+// the context is canceled or the input channel closes.
+func RunMatchingEngine(
+	ctx context.Context,
+	engine *Engine,
+	in <-chan Command,
+	out chan<- Event,
+) error {
+	if engine == nil {
+		return fmt.Errorf("matching engine is nil")
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case cmd := <-in:
-			events := engine.Apply(cmd)
-			for _, event := range events {
+		case command, ok := <-in:
+			if !ok {
+				return nil
+			}
+			for _, event := range engine.Apply(command) {
 				select {
 				case <-ctx.Done():
 					return nil
