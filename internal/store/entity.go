@@ -1,4 +1,4 @@
-package entity
+package store
 
 type Account struct {
 	ID           int64  `json:"id" gorm:"primaryKey"`
@@ -85,4 +85,19 @@ type Fill struct {
 	Fee       int64  `json:"fee" gorm:"not null;default:0"`
 	Role      string `json:"role" gorm:"not null;size:8"` // maker/taker
 	CreatedAt int64  `json:"created_at" gorm:"autoCreateTime"`
+}
+
+// LedgerEntry 账户资金流水。
+// 每一次余额或冻结资金变化，都应该有对应的流水记录。
+type LedgerEntry struct {
+	ID        int64 `gorm:"primaryKey;autoIncrement"`
+	AccountID int64 `gorm:"not null;index"`
+
+	Type   string `gorm:"not null;size:32"` // deposit/withdrawal/margin_freeze/realized_pnl/trading_fee 等
+	Amount int64  // 正数增加，负数减少
+
+	ReferenceType string `gorm:"size:32"` // order/trade/position/liquidation
+	ReferenceID   int64
+
+	CreatedAt int64
 }
