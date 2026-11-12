@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"io"
 
-	"my-go-exchange/internal/types"
+	"my-go-exchange/internal/constant"
 )
 
-// EventType identifies an event in the serialized event stream.
 type EventType string
 
 const (
@@ -23,61 +22,73 @@ const (
 // engine-wide ordering without forcing callers to type-switch first.
 type Event interface {
 	Kind() EventType
-	Sequence() uint64
+	Sequence() int64
 }
 
 // OrderAccepted records an order accepted by the matching engine.
 type OrderAccepted struct {
-	Seq       uint64          `json:"seq"`
-	OrderID   uint64          `json:"order_id"`
-	AccountID uint64          `json:"account_id"`
-	Price     uint64          `json:"price"`
-	Amount    uint64          `json:"amount"`
-	Side      types.Side      `json:"side"`
-	Type      types.OrderType `json:"type"`
-	TIF       types.TIF       `json:"tif"`
+	Seq           int64                 `json:"seq"`
+	OrderID       int64                 `json:"order_id"`
+	AccountID     int64                 `json:"account_id"`
+	Price         int64                 `json:"price"`
+	Amount        int64                 `json:"amount"`
+	ClientOrderID string                `json:"client_order_id,omitempty"`
+	Symbol        string                `json:"symbol"`
+	OrderSide     constant.OrderSide    `json:"side"`
+	PositionSide  constant.PositionSide `json:"position_side"`
+	Type          constant.OrderType    `json:"type"`
+	Leverage      int64                 `json:"leverage"`
+	// TIF       constant.TIF       `json:"tif"`
 }
 
-func (e *OrderAccepted) Kind() EventType  { return EventOrderAccepted }
-func (e *OrderAccepted) Sequence() uint64 { return e.Seq }
+func (e *OrderAccepted) Kind() EventType { return EventOrderAccepted }
+func (e *OrderAccepted) Sequence() int64 { return e.Seq }
 
 // OrderCanceled records cancellation of an accepted order. Remaining is the
 // quantity that had not traded when cancellation took effect.
 type OrderCanceled struct {
-	Seq       uint64 `json:"seq"`
-	OrderID   uint64 `json:"order_id"`
-	Remaining uint64 `json:"remaining"`
+	Seq       int64  `json:"seq"`
+	OrderID   int64  `json:"order_id"`
+	Remaining int64  `json:"remaining"`
+	Reason    string `json:"reason,omitempty"`
 }
 
-func (e *OrderCanceled) Kind() EventType  { return EventOrderCanceled }
-func (e *OrderCanceled) Sequence() uint64 { return e.Seq }
+func (e *OrderCanceled) Kind() EventType { return EventOrderCanceled }
+func (e *OrderCanceled) Sequence() int64 { return e.Seq }
 
 // OrderRejected records a command that did not complete successfully.
 // OrderID is zero when rejection happened before an ID was assigned.
 type OrderRejected struct {
-	Seq     uint64 `json:"seq"`
-	OrderID uint64 `json:"order_id"`
-	Reason  string `json:"reason"`
+	Seq           int64  `json:"seq"`
+	OrderID       int64  `json:"order_id"`
+	AccountID     int64  `json:"account_id"`
+	ClientOrderID string `json:"client_order_id,omitempty"`
+	Reason        string `json:"reason"`
 }
 
-func (e *OrderRejected) Kind() EventType  { return EventOrderRejected }
-func (e *OrderRejected) Sequence() uint64 { return e.Seq }
+func (e *OrderRejected) Kind() EventType { return EventOrderRejected }
+func (e *OrderRejected) Sequence() int64 { return e.Seq }
 
-// Trade records one execution between a resting maker and an incoming taker.
-type Trade struct {
-	Seq            uint64     `json:"seq"`
-	TradeID        uint64     `json:"trade_id"`
-	Price          uint64     `json:"price"`
-	Amount         uint64     `json:"amount"`
-	TakerSide      types.Side `json:"taker_side"`
-	TakerOrderID   uint64     `json:"taker_order_id"`
-	MakerOrderID   uint64     `json:"maker_order_id"`
-	TakerAccountID uint64     `json:"taker_account_id"`
-	MakerAccountID uint64     `json:"maker_account_id"`
+// TradeEvent records one execution between a resting maker and an incoming
+// taker.
+type TradeEvent struct {
+	Seq            int64              `json:"seq"`
+	TradeID        int64              `json:"trade_id"`
+	Price          int64              `json:"price"`
+	Amount         int64              `json:"amount"`
+	TakerSide      constant.OrderSide `json:"taker_side"`
+	TakerOrderID   int64              `json:"taker_order_id"`
+	MakerOrderID   int64              `json:"maker_order_id"`
+	TakerAccountID int64              `json:"taker_account_id"`
+	MakerAccountID int64              `json:"maker_account_id"`
+	MakerState     constant.State     `json:"maker_state"`
+	MakerRemaining int64              `json:"maker_remaining"`
+	TakerState     constant.State     `json:"taker_state"`
+	TakerRemaining int64              `json:"taker_remaining"`
 }
 
-func (e *Trade) Kind() EventType  { return EventTrade }
-func (e *Trade) Sequence() uint64 { return e.Seq }
+func (e *TradeEvent) Kind() EventType { return EventTrade }
+func (e *TradeEvent) Sequence() int64 { return e.Seq }
 
 type eventEnvelope struct {
 	Type    EventType       `json:"type"`
@@ -103,7 +114,7 @@ func MarshalEvent(event Event) ([]byte, error) {
 			return nil, fmt.Errorf("marshal event: nil %T", e)
 		}
 		payload = e
-	case *Trade:
+	case *TradeEvent:
 		if e == nil {
 			return nil, fmt.Errorf("marshal event: nil %T", e)
 		}
@@ -141,7 +152,7 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	case EventOrderRejected:
 		event = &OrderRejected{}
 	case EventTrade:
-		event = &Trade{}
+		event = &TradeEvent{}
 	default:
 		return nil, fmt.Errorf("decode event envelope: unknown type %q", env.Type)
 	}

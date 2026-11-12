@@ -2,40 +2,39 @@ package matching
 
 import (
 	"context"
+	"my-go-exchange/internal/trading"
 	"strings"
 	"testing"
 	"time"
 
-	"my-go-exchange/internal/errs"
-	"my-go-exchange/internal/types"
+	"my-go-exchange/internal/constant"
 )
 
 func matchingEngine() *Engine {
-	return NewEngine(&types.Instrument{Symbol: "TEST/QUOTE"})
+	return NewEngine(&trading.Instrument{Symbol: "TEST/QUOTE"}, NewIDAllocator())
 }
 
 func place(
-	accountID uint64,
-	side types.Side,
-	orderType types.OrderType,
-	price uint64,
-	amount uint64,
-	tif types.TIF,
+	accountID int64,
+	side constant.OrderSide,
+	orderType constant.OrderType,
+	price int64,
+	amount int64,
 ) *PlaceOrder {
 	return &PlaceOrder{
 		AccountID: accountID,
-		Side:      side,
+		OrderSide: side,
 		Type:      orderType,
 		Price:     price,
 		Amount:    amount,
-		TIF:       tif,
+		// TIF:       tif,
 	}
 }
 
-func tradeEvents(events []Event) []*Trade {
-	trades := make([]*Trade, 0, len(events))
+func tradeEvents(events []Event) []*TradeEvent {
+	trades := make([]*TradeEvent, 0, len(events))
 	for _, event := range events {
-		if trade, ok := event.(*Trade); ok {
+		if trade, ok := event.(*TradeEvent); ok {
 			trades = append(trades, trade)
 		}
 	}
@@ -44,7 +43,7 @@ func tradeEvents(events []Event) []*Trade {
 
 func assertUniqueIncreasingSequence(t *testing.T, events []Event) {
 	t.Helper()
-	previous := uint64(0)
+	previous := int64(0)
 	for _, event := range events {
 		if event.Sequence() <= previous {
 			t.Fatalf("event sequence = %d, previous = %d", event.Sequence(), previous)
@@ -55,7 +54,16 @@ func assertUniqueIncreasingSequence(t *testing.T, events []Event) {
 
 func TestLimitRestsWithoutCrossing(t *testing.T) {
 	engine := matchingEngine()
-	events := engine.Apply(place(1, types.Buy, types.Limit, 100, 10, types.GTC))
+	events := engine.Apply(&PlaceOrder{
+		AccountID:     1,
+		ClientOrderID: "client-1",
+		OrderSide:     constant.Buy,
+		PositionSide:  constant.Long,
+		Type:          constant.Limit,
+		Price:         100,
+		Amount:        10,
+		Leverage:      5,
+	})
 
 	if len(events) != 1 {
 		t.Fatalf("events = %+v, want one accepted event", events)
@@ -67,6 +75,14 @@ func TestLimitRestsWithoutCrossing(t *testing.T) {
 	if accepted.Seq != 1 || accepted.OrderID != 1 {
 		t.Fatalf("accepted = %+v, want seq 1 and order 1", accepted)
 	}
+	if accepted.ClientOrderID != "client-1" || accepted.Symbol != "TEST/QUOTE" ||
+		accepted.PositionSide != constant.Long || accepted.Leverage != 5 {
+		t.Fatalf("accepted identity = %+v", accepted)
+	}
+	if order := engine.GetOrder(accepted.OrderID); order == nil ||
+		order.ClientOrderID != "client-1" || order.State != constant.StateInBook {
+		t.Fatalf("resting order = %+v, want client-1 and inbook", order)
+	}
 
 	price, amount, ok := engine.OrderBook().BestBid()
 	if !ok || price != 100 || amount != 10 {
@@ -74,11 +90,25 @@ func TestLimitRestsWithoutCrossing(t *testing.T) {
 	}
 }
 
+func TestApplyWithResultCapturesBookChanges(t *testing.T) {
+	engine := matchingEngine()
+	result := engine.ApplyWithResult(place(1, constant.Buy, constant.Limit, 100, 10))
+	if len(result.Events) != 1 {
+		t.Fatalf("events = %+v, want one accepted event", result.Events)
+	}
+	if len(result.BookChanges.Bids) != 1 {
+		t.Fatalf("bid changes = %+v, want one level", result.BookChanges.Bids)
+	}
+	if change := result.BookChanges.Bids[0]; change.Price != 100 || change.Amount != 10 {
+		t.Fatalf("bid change = %+v, want price 100 amount 10", change)
+	}
+}
+
 func TestPartialFillThenRest(t *testing.T) {
 	engine := matchingEngine()
-	engine.Apply(place(1, types.Sell, types.Limit, 100, 4, types.GTC))
+	engine.Apply(place(1, constant.Sell, constant.Limit, 100, 4))
 
-	events := engine.Apply(place(2, types.Buy, types.Limit, 100, 10, types.GTC))
+	events := engine.Apply(place(2, constant.Buy, constant.Limit, 100, 10))
 	trades := tradeEvents(events)
 	if len(trades) != 1 {
 		t.Fatalf("trades = %+v, want one trade", trades)
@@ -96,11 +126,25 @@ func TestPartialFillThenRest(t *testing.T) {
 	if trade.MakerAccountID != 1 || trade.TakerAccountID != 2 {
 		t.Fatalf("trade accounts = (%d,%d), want (1,2)", trade.MakerAccountID, trade.TakerAccountID)
 	}
+	if trade.MakerState != constant.StateFilled || trade.MakerRemaining != 0 {
+		t.Fatalf("maker post-fill = (%s,%d), want filled/0", trade.MakerState, trade.MakerRemaining)
+	}
+	if trade.TakerState != constant.StatePartial || trade.TakerRemaining != 6 {
+		t.Fatalf("taker post-fill = (%s,%d), want partial/6", trade.TakerState, trade.TakerRemaining)
+	}
 	assertUniqueIncreasingSequence(t, events)
 
-	resting, ok := engine.OrderBook().Front(types.Buy)
+	resting, ok := engine.OrderBook().Front(constant.Buy)
 	if !ok || resting.ID != 2 || resting.Remaining != 6 || resting.Seq != 2 {
 		t.Fatalf("resting taker = %+v, want order 2 remaining 6 at seq 2", resting)
+	}
+	maker := engine.GetOrder(1)
+	if maker == nil || maker.State != constant.StateFilled || maker.Remaining != 0 {
+		t.Fatalf("maker = %+v, want filled with zero remaining", maker)
+	}
+	taker := engine.GetOrder(2)
+	if taker == nil || taker.State != constant.StatePartial || taker.Remaining != 6 {
+		t.Fatalf("taker = %+v, want partial with six remaining", taker)
 	}
 	price, amount, ok := engine.OrderBook().BestBid()
 	if !ok || price != 100 || amount != 6 {
@@ -110,11 +154,11 @@ func TestPartialFillThenRest(t *testing.T) {
 
 func TestMatchingUsesPriceThenTimePriority(t *testing.T) {
 	engine := matchingEngine()
-	engine.Apply(place(1, types.Sell, types.Limit, 100, 2, types.GTC))
-	engine.Apply(place(2, types.Sell, types.Limit, 100, 3, types.GTC))
-	engine.Apply(place(3, types.Sell, types.Limit, 101, 5, types.GTC))
+	engine.Apply(place(1, constant.Sell, constant.Limit, 100, 2))
+	engine.Apply(place(2, constant.Sell, constant.Limit, 100, 3))
+	engine.Apply(place(3, constant.Sell, constant.Limit, 101, 5))
 
-	events := engine.Apply(place(4, types.Buy, types.Limit, 101, 4, types.GTC))
+	events := engine.Apply(place(4, constant.Buy, constant.Limit, 101, 4))
 	trades := tradeEvents(events)
 	if len(trades) != 2 {
 		t.Fatalf("trades = %+v, want two trades", trades)
@@ -126,18 +170,37 @@ func TestMatchingUsesPriceThenTimePriority(t *testing.T) {
 		t.Fatalf("second trade = %+v, want maker 2 amount 2", trades[1])
 	}
 
-	maker, ok := engine.OrderBook().Front(types.Sell)
+	maker, ok := engine.OrderBook().Front(constant.Sell)
 	if !ok || maker.ID != 2 || maker.Remaining != 1 {
 		t.Fatalf("remaining best maker = %+v, want order 2 remaining 1", maker)
+	}
+	if makerState := engine.GetOrder(2); makerState == nil ||
+		makerState.State != constant.StatePartial {
+		t.Fatalf("maker state = %+v, want partial", makerState)
+	}
+	if takerState := engine.GetOrder(4); takerState == nil ||
+		takerState.State != constant.StateFilled {
+		t.Fatalf("taker state = %+v, want filled", takerState)
+	}
+}
+
+func TestOrderBookSharesEngineOrderPointer(t *testing.T) {
+	engine := matchingEngine()
+	engine.Apply(place(1, constant.Buy, constant.Limit, 100, 1))
+
+	order := engine.GetOrder(1)
+	front, ok := engine.OrderBook().Front(constant.Buy)
+	if !ok || order != front {
+		t.Fatalf("front = %p, want engine order %p", front, order)
 	}
 }
 
 func TestMarketSweepsLevelsAndCancelsRemainder(t *testing.T) {
 	engine := matchingEngine()
-	engine.Apply(place(1, types.Sell, types.Limit, 100, 2, types.GTC))
-	engine.Apply(place(2, types.Sell, types.Limit, 110, 3, types.GTC))
+	engine.Apply(place(1, constant.Sell, constant.Limit, 100, 2))
+	engine.Apply(place(2, constant.Sell, constant.Limit, 110, 3))
 
-	events := engine.Apply(place(3, types.Buy, types.Market, 0, 10, types.GTC))
+	events := engine.Apply(place(3, constant.Buy, constant.Market, 0, 10))
 	trades := tradeEvents(events)
 	if len(trades) != 2 {
 		t.Fatalf("trades = %+v, want two trades", trades)
@@ -150,7 +213,8 @@ func TestMarketSweepsLevelsAndCancelsRemainder(t *testing.T) {
 	}
 
 	canceled, ok := events[len(events)-1].(*OrderCanceled)
-	if !ok || canceled.OrderID != 3 || canceled.Remaining != 5 {
+	if !ok || canceled.OrderID != 3 || canceled.Remaining != 5 ||
+		canceled.Reason != "market_order_unfilled" {
 		t.Fatalf("last event = %+v, want canceled order 3 remaining 5", events[len(events)-1])
 	}
 	if _, _, ok := engine.OrderBook().BestBid(); ok {
@@ -221,12 +285,16 @@ func TestMarketSweepsLevelsAndCancelsRemainder(t *testing.T) {
 
 func TestCancelRestingOrderAndRejectUnknownOrder(t *testing.T) {
 	engine := matchingEngine()
-	engine.Apply(place(1, types.Buy, types.Limit, 100, 10, types.GTC))
+	engine.Apply(place(1, constant.Buy, constant.Limit, 100, 10))
 
 	canceledEvents := engine.Apply(&CancelOrder{OrderID: 1})
 	canceled, ok := canceledEvents[0].(*OrderCanceled)
-	if !ok || canceled.Remaining != 10 {
+	if !ok || canceled.Remaining != 10 || canceled.Reason != "user_canceled" {
 		t.Fatalf("cancel events = %+v", canceledEvents)
+	}
+	if order := engine.GetOrder(1); order == nil ||
+		order.State != constant.StateCanceled {
+		t.Fatalf("canceled order = %+v, want canceled", order)
 	}
 	if _, _, ok := engine.OrderBook().BestBid(); ok {
 		t.Fatal("canceled bid should be removed")
@@ -234,7 +302,7 @@ func TestCancelRestingOrderAndRejectUnknownOrder(t *testing.T) {
 
 	rejectedEvents := engine.Apply(&CancelOrder{OrderID: 1})
 	rejected, ok := rejectedEvents[0].(*OrderRejected)
-	if !ok || rejected.OrderID != 1 || rejected.Reason != errs.ErrOrderNotCancellable.Error() {
+	if !ok || rejected.OrderID != 1 || rejected.Reason != constant.ErrOrderNotCancellable.Error() {
 		t.Fatalf("unknown-order events = %+v", rejectedEvents)
 	}
 }
@@ -242,18 +310,25 @@ func TestCancelRestingOrderAndRejectUnknownOrder(t *testing.T) {
 func TestInvalidPlaceIsRejectedBeforeAcceptance(t *testing.T) {
 	engine := matchingEngine()
 	tests := []*PlaceOrder{
-		place(0, types.Buy, types.Limit, 100, 1, types.GTC),
-		place(1, types.Buy, types.Limit, 0, 1, types.GTC),
-		place(1, types.Buy, types.Market, 100, 1, types.GTC),
+		place(0, constant.Buy, constant.Limit, 100, 1),
+		place(1, constant.Buy, constant.Limit, 0, 1),
+		place(1, constant.Buy, constant.Market, 100, 1),
 	}
 
 	for _, command := range tests {
+		command.ClientOrderID = "client-invalid"
 		events := engine.Apply(command)
 		if len(events) != 1 {
 			t.Fatalf("events = %+v, want one rejection", events)
 		}
-		if _, ok := events[0].(*OrderRejected); !ok {
+		rejected, ok := events[0].(*OrderRejected)
+		if !ok {
 			t.Fatalf("event type = %T, want OrderRejected", events[0])
+		}
+		if rejected.AccountID != command.AccountID ||
+			rejected.ClientOrderID != command.ClientOrderID ||
+			rejected.Reason == "" {
+			t.Fatalf("rejection identity = %+v", rejected)
 		}
 	}
 
@@ -284,7 +359,7 @@ func TestRunMatchingEngineSerializesCommands(t *testing.T) {
 	engine := matchingEngine()
 	in := make(chan Command, 2)
 	out := make(chan Event, 4)
-	in <- place(1, types.Buy, types.Limit, 100, 1, types.GTC)
+	in <- place(1, constant.Buy, constant.Limit, 100, 1)
 	in <- &CancelOrder{OrderID: 1}
 	close(in)
 

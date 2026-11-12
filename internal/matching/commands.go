@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"io"
 
-	"my-go-exchange/internal/types"
+	"my-go-exchange/internal/constant"
 )
 
-// CommandType identifies a command in the serialized command stream.
 type CommandType string
 
 const (
@@ -25,19 +24,22 @@ type Command interface {
 
 // PlaceOrder requests that the engine accept and match an order.
 type PlaceOrder struct {
-	AccountID uint64          `json:"account_id"`
-	Price     uint64          `json:"price"`
-	Amount    uint64          `json:"amount"`
-	Side      types.Side      `json:"side"`
-	Type      types.OrderType `json:"type"`
-	TIF       types.TIF       `json:"tif"`
+	AccountID     int64                 `json:"account_id"`
+	ClientOrderID string                `json:"client_order_id"`
+	Price         int64                 `json:"price"`
+	Amount        int64                 `json:"amount"`
+	Leverage      int64                 `json:"leverage"`
+	OrderSide     constant.OrderSide    `json:"side"`
+	PositionSide  constant.PositionSide `json:"position_side"`
+	Type          constant.OrderType    `json:"type"`
+	// TIF       constant.TIF       `json:"tif"`
 }
 
 func (c *PlaceOrder) Kind() CommandType { return CmdPlaceOrder }
 
 // CancelOrder requests cancellation of an order that is still resting.
 type CancelOrder struct {
-	OrderID uint64 `json:"order_id"`
+	OrderID int64 `json:"order_id"`
 }
 
 func (c *CancelOrder) Kind() CommandType { return CmdCancelOrder }
@@ -72,7 +74,7 @@ func MarshalCommand(cmd Command) ([]byte, error) {
 	return json.Marshal(commandEnvelope{Type: cmd.Kind(), Payload: raw})
 }
 
-// UnmarshalCommand decodes a type-tagged command envelope.
+// UnmarshalCommand decodes a supported command from a type-tagged envelope.
 func UnmarshalCommand(data []byte) (Command, error) {
 	var env commandEnvelope
 	if err := decodeCommandJSON(data, &env); err != nil {
@@ -97,12 +99,15 @@ func UnmarshalCommand(data []byte) (Command, error) {
 
 func decodePlaceOrder(data []byte) (*PlaceOrder, error) {
 	var payload struct {
-		AccountID *uint64          `json:"account_id"`
-		Price     *uint64          `json:"price"`
-		Amount    *uint64          `json:"amount"`
-		Side      *types.Side      `json:"side"`
-		Type      *types.OrderType `json:"type"`
-		TIF       *types.TIF       `json:"tif"`
+		AccountID     *int64                `json:"account_id"`
+		ClientOrderID string                `json:"client_order_id"`
+		Price         *int64                `json:"price"`
+		Amount        *int64                `json:"amount"`
+		Leverage      int64                 `json:"leverage"`
+		OrderSide     *constant.OrderSide   `json:"side"`
+		PositionSide  constant.PositionSide `json:"position_side"`
+		Type          *constant.OrderType   `json:"type"`
+		// TIF       constant.TIF       `json:"tif"`
 	}
 	if err := decodeCommandJSON(data, &payload); err != nil {
 		return nil, fmt.Errorf("decode %s payload: %w", CmdPlaceOrder, err)
@@ -112,7 +117,7 @@ func decodePlaceOrder(data []byte) (*PlaceOrder, error) {
 		"account_id": payload.AccountID != nil,
 		"price":      payload.Price != nil,
 		"amount":     payload.Amount != nil,
-		"side":       payload.Side != nil,
+		"side":       payload.OrderSide != nil,
 		"type":       payload.Type != nil,
 	}
 	for _, field := range []string{"account_id", "price", "amount", "side", "type"} {
@@ -121,25 +126,22 @@ func decodePlaceOrder(data []byte) (*PlaceOrder, error) {
 		}
 	}
 
-	// TIF remains optional and is copied only for forward compatibility.
-	var tif types.TIF
-	if payload.TIF != nil {
-		tif = *payload.TIF
-	}
-
 	return &PlaceOrder{
-		AccountID: *payload.AccountID,
-		Price:     *payload.Price,
-		Amount:    *payload.Amount,
-		Side:      *payload.Side,
-		Type:      *payload.Type,
-		TIF:       tif,
+		AccountID:     *payload.AccountID,
+		ClientOrderID: payload.ClientOrderID,
+		Price:         *payload.Price,
+		Amount:        *payload.Amount,
+		Leverage:      payload.Leverage,
+		OrderSide:     *payload.OrderSide,
+		PositionSide:  payload.PositionSide,
+		Type:          *payload.Type,
+		// TIF:       payload.TIF,
 	}, nil
 }
 
 func decodeCancelOrder(data []byte) (*CancelOrder, error) {
 	var payload struct {
-		OrderID *uint64 `json:"order_id"`
+		OrderID *int64 `json:"order_id"`
 	}
 	if err := decodeCommandJSON(data, &payload); err != nil {
 		return nil, fmt.Errorf("decode %s payload: %w", CmdCancelOrder, err)

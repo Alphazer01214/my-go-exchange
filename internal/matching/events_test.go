@@ -5,33 +5,47 @@ import (
 	"strings"
 	"testing"
 
-	"my-go-exchange/internal/types"
+	"my-go-exchange/internal/constant"
 )
 
 func TestEventEnvelopeRoundTrip(t *testing.T) {
 	tests := []Event{
 		&OrderAccepted{
-			Seq:       1,
-			OrderID:   2,
-			AccountID: 3,
-			Price:     100,
-			Amount:    4,
-			Side:      types.Buy,
-			Type:      types.Limit,
-			TIF:       types.GTC,
+			Seq:           1,
+			OrderID:       2,
+			AccountID:     3,
+			ClientOrderID: "client-2",
+			Symbol:        "TEST/QUOTE",
+			Price:         100,
+			Amount:        4,
+			OrderSide:     constant.Buy,
+			PositionSide:  constant.Long,
+			Type:          constant.Limit,
+			Leverage:      5,
+			// TIF:       constant.GTC,
 		},
-		&OrderCanceled{Seq: 2, OrderID: 2, Remaining: 1},
-		&OrderRejected{Seq: 3, OrderID: 2, Reason: "invalid"},
-		&Trade{
+		&OrderCanceled{Seq: 2, OrderID: 2, Remaining: 1, Reason: "user_canceled"},
+		&OrderRejected{
+			Seq:           3,
+			OrderID:       2,
+			AccountID:     3,
+			ClientOrderID: "client-2",
+			Reason:        "invalid",
+		},
+		&TradeEvent{
 			Seq:            4,
 			TradeID:        1,
 			Price:          100,
 			Amount:         3,
-			TakerSide:      types.Buy,
+			TakerSide:      constant.Buy,
 			TakerOrderID:   2,
 			MakerOrderID:   1,
 			TakerAccountID: 3,
 			MakerAccountID: 4,
+			MakerState:     constant.StatePartial,
+			MakerRemaining: 1,
+			TakerState:     constant.StateFilled,
+			TakerRemaining: 0,
 		},
 	}
 
@@ -59,7 +73,7 @@ func TestEventEnvelopeErrors(t *testing.T) {
 	if _, err := MarshalEvent(nil); err == nil {
 		t.Fatal("MarshalEvent(nil) should fail")
 	}
-	if _, err := MarshalEvent(&Trade{Seq: 1, TradeID: 1}); err != nil {
+	if _, err := MarshalEvent(&TradeEvent{Seq: 1, TradeID: 1}); err != nil {
 		t.Fatalf("MarshalEvent supported event: %v", err)
 	}
 

@@ -5,18 +5,21 @@ import (
 	"strings"
 	"testing"
 
-	"my-go-exchange/internal/types"
+	"my-go-exchange/internal/constant"
 )
 
 func TestCommandEnvelopeRoundTrip(t *testing.T) {
 	tests := []Command{
 		&PlaceOrder{
-			AccountID: 7,
-			Price:     123,
-			Amount:    9,
-			Side:      types.Sell,
-			Type:      types.Limit,
-			TIF:       types.IOC,
+			AccountID:     7,
+			ClientOrderID: "client-7",
+			Price:         123,
+			Amount:        9,
+			Leverage:      10,
+			OrderSide:     constant.Sell,
+			PositionSide:  constant.Short,
+			Type:          constant.Limit,
+			// TIF:       constant.IOC,
 		},
 		&CancelOrder{OrderID: 42},
 	}
@@ -59,7 +62,7 @@ func TestCommandEnvelopeErrors(t *testing.T) {
 		{name: "missing payload", data: `{"type":"place_order"}`, want: "missing payload"},
 		{
 			name: "missing place field",
-			data: `{"type":"place_order","payload":{"account_id":1,"price":2,"side":0,"type":0}}`,
+			data: `{"type":"place_order","payload":{"account_id":1,"price":2,"side":"buy","type":"limit"}}`,
 			want: `missing field "amount"`,
 		},
 		{
